@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Notices Dashboard
+Comment=Open the Notices dashboard
+Terminal=false
+Categories=Office;
+
+# Linux file managers won't run a plain script on double-click, so this wrapper
+# exists to point at the one that macOS uses. %k is this file's own path, which
+# keeps the entry working wherever the folder is checked out -- no absolute
+# path to edit. Mark it executable and, in some desktops, "Allow Launching".
+Exec=sh -c 'cd "$(dirname "$(echo %k | sed s,^file://,,)")" && exec "./Notices Dashboard.command"'
