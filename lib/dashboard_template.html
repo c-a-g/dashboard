@@ -741,6 +741,22 @@ function note(text, isError) {
   el.title = text;
 }
 
+// A reload wipes the status line, so a message worth keeping is parked here for
+// the next load. sessionStorage rather than localStorage: it belongs to this tab
+// and this visit, and a stale explanation days later would be worse than none.
+const NOTE_KEY = "syncNote";
+
+function carryNote(text) {
+  try { sessionStorage.setItem(NOTE_KEY, text); } catch (err) { /* private mode */ }
+}
+
+function restoreNote() {
+  try {
+    const text = sessionStorage.getItem(NOTE_KEY);
+    if (text) { sessionStorage.removeItem(NOTE_KEY); note(text); }
+  } catch (err) { /* nothing worth failing a load over */ }
+}
+
 // -- theme ------------------------------------------------------------------
 // auto follows the OS; light and dark override it.
 const SYSTEM_DARK = matchMedia("(prefers-color-scheme: dark)");
@@ -1519,21 +1535,66 @@ if (!served) {
       hint: "usually under a minute.",
       cancellable: false,
     },
+    // Chosen when the day's allowance is already gone. The run refuses before
+    // it sends anything and drops straight to the sweep, the prunes, the
+    // compaction and the page -- under a second, all told. Promising "several
+    // minutes" of fetching there reads as a fault when the quota notice lands
+    // an instant later.
+    capped: {
+      label: "Quota spent — tidying up and rebuilding",
+      hint: "a moment.",
+      cancellable: true,
+    },
   };
+
+  // Requests spent today, from the last heartbeat, so the button can tell which
+  // of those two runs it is about to start. Null until the first reply lands.
+  let spentToday = null;
   let ticker = null;
   let stopping = false;
   let localJob = false;   // this tab is awaiting its own /api/sync
   let adopted = false;    // showing Stop for a run this tab did not start
+  // Which step the server is on, from the last heartbeat. A sync is four
+  // subprocesses, so the line reads "Fetching descriptions" rather than
+  // "Syncing" for the twenty minutes that step takes.
+  let jobStep = null;
 
   // Heartbeat: the server exits once these stop. The reply also says whether a
   // job holds the server lock, which is how a reloaded tab -- or one whose sync
   // request was dropped -- recovers a working Stop button.
-  const ping = () => fetch("/api/ping")
-    .then((r) => r.json())
-    .then((state) => { renderQuota(state.requests); adoptJobState(state); })
-    .catch(() => {});
+  // Idle it is only a keep-alive, so it stays cheap. While a job holds the lock
+  // it is also the progress feed -- the step records each API request as it is
+  // sent -- so it beats fast enough to look continuous. /api/ping reads one row
+  // without touching the schema, which is what makes the faster rate affordable.
+  const IDLE_MS = 15000, BUSY_MS = 1500;
+  let beat = null, beatMs = 0;
+  const setBeat = (ms) => {
+    if (ms === beatMs && beat) return;
+    beatMs = ms;
+    if (beat) clearInterval(beat);
+    beat = setInterval(ping, ms);
+  };
+  function ping() {
+    return fetch("/api/ping")
+      .then((r) => r.json())
+      .then((state) => {
+        renderQuota(state.requests);
+        if (state.requests && state.requests.total != null) {
+          spentToday = state.requests.total;
+        }
+        jobStep = state.step || null;
+        adoptJobState(state);
+        // localJob holds the fast beat too: this tab's own /api/sync is still
+        // open, and a reply that overtook the POST would otherwise report
+        // nothing running and drop the beat back to idle for 15s.
+        setBeat((state.running || localJob) ? BUSY_MS : IDLE_MS);
+      })
+      .catch(() => {});
+  }
   ping();
-  setInterval(ping, 15000);
+  setBeat(IDLE_MS);
+  // Whatever the run before the reload wanted to say.
+  restoreNote();
   // Coming back to a backgrounded tab shouldn't wait up to 15s to check in.
   document.addEventListener("visibilitychange", () => { if (!document.hidden) ping(); });
 
@@ -1553,7 +1614,9 @@ if (!served) {
     const started = Date.now() - agoMs;
     const paint = () => {
       const s = Math.round((Date.now() - started) / 1000);
-      const word = stopping ? "Stopping" : label;
+      // The server's own name for the step wins once it reports one; `label` is
+      // what to say in the moment before the first heartbeat answers.
+      const word = stopping ? "Stopping" : (jobStep || label);
       note(`${word}… ${Math.floor(s / 60)}m ${s % 60}s`);
     };
     // A fresh run shows the hint until the first tick lands; an adopted one
@@ -1567,6 +1630,7 @@ if (!served) {
     stopping = false;
     localJob = false;
     adopted = false;
+    jobStep = null;
     syncBtn.classList.remove("stop");
     syncBtn.textContent = SYNC_LABEL;
     syncBtn.disabled = rerankBtn.disabled = false;
@@ -1626,6 +1690,13 @@ if (!served) {
       syncBtn.disabled = true;
     }
     startTicker(running, hint);
+    // Go to the fast beat now and ask straight away, rather than waiting out
+    // whatever is left of the idle one: `running` is a summary of the whole job,
+    // and until the first reply names a step it is all the line can say. A run
+    // that finishes quickly -- a capped sync does nothing but rebuild -- would
+    // otherwise show that summary for its entire length.
+    setBeat(BUSY_MS);
+    ping();
     try {
       const res = await fetch(path, {
         method: "POST",
@@ -1649,9 +1720,20 @@ if (!served) {
         setIdle();
         return;
       }
-      // A used-up daily quota is expected, not a fault.
-      note(data.quota ? data.error
-        : (data.error || "Failed.").split("\n")[0].slice(0, 160), !data.quota);
+      // A used-up daily quota is expected, not a fault. The sweep, prune, ranker
+      // and rebuild all went ahead without spending a request, so the page behind
+      // us has moved on: reload to show it, carrying the explanation across.
+      if (data.quota) {
+        if (data.rebuilt) {
+          carryNote(data.error);
+          location.reload();
+          return;
+        }
+        note(data.error);
+        setIdle();
+        return;
+      }
+      note((data.error || "Failed.").split("\n")[0].slice(0, 160), true);
     } catch (err) {
       stopTicker();
       note("Could not reach the server: " + err.message, true);
@@ -1665,7 +1747,8 @@ if (!served) {
       stopJob();
       return;
     }
-    runJob("/api/sync", JOBS.sync.label, JOBS.sync.hint, JOBS.sync.cancellable);
+    const job = spentToday != null && spentToday >= DAILY_QUOTA ? JOBS.capped : JOBS.sync;
+    runJob("/api/sync", job.label, job.hint, job.cancellable);
   });
 
   // Nothing fetched: it re-reads what is already stored, so no quota is spent.

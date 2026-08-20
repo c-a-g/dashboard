@@ -19,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +141,7 @@ class ApiClient:
         sleep_between: float = 0.25,
         max_retries: int = 5,
         stop_on_rate_limit: bool = False,
+        on_request: Callable[[int], None] | None = None,
     ) -> None:
         self.stop_on_rate_limit = stop_on_rate_limit
         if not api_key:
@@ -150,7 +151,26 @@ class ApiClient:
         self.sleep_between = sleep_between
         self.max_retries = max_retries
         self.request_count = 0
+        self._on_request = on_request
         self._opener = urllib.request.build_opener(_IPv4HTTPSHandler())
+
+    def _charge(self) -> None:
+        """Record one request as sent -- and therefore spent.
+
+        Called the moment the request has gone out: the quota is charged for
+        asking, not for liking the answer. `on_request` lets the caller persist
+        that spend as it happens rather than at the end of the step, which is
+        what lets a watching page count along in real time and what leaves a
+        run killed mid-flight with an accurate tally.
+        """
+        self.request_count += 1
+        if self._on_request is None:
+            return
+        try:
+            self._on_request(1)
+        except Exception:  # noqa: BLE001
+            # Progress reporting must never be able to fail a sync.
+            log.debug("on_request callback raised; ignoring", exc_info=True)
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -166,14 +186,14 @@ class ApiClient:
         for attempt in range(1, self.max_retries + 1):
             try:
                 with self._opener.open(request, timeout=self.timeout) as response:
-                    self.request_count += 1
+                    self._charge()
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 # Spent either way: the quota is charged for the request, not for
                 # liking the answer. A 429 costs one too, which is why a counter
                 # built from successes alone can never reach the ceiling -- it
                 # goes quiet on the very request that proves the limit is real.
-                self.request_count += 1
+                self._charge()
                 body = exc.read().decode("utf-8", "replace")[:500]
                 if exc.code in (401, 403):
                     raise ApiError(

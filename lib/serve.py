@@ -34,12 +34,14 @@ if str(ROOT) not in sys.path:
 
 from lib.dashboard import FEEDBACK_SLOT        # noqa: E402  (needs the path above)
 from lib.store import (                        # noqa: E402
-    active_ranker,
+    clear_phase,
     connect,
+    get_phase,
     hidden_ids,
     kept_ids,
     requests_used_today,
     set_feedback,
+    set_phase,
 )
 
 DASHBOARD = ROOT / "data" / "dashboard.html"
@@ -160,19 +162,50 @@ def stopped() -> bool:
         return stop_requested
 
 
+def _quick(fn, default=None):
+    """One short read or write, without store.connect()'s schema and migration.
+
+    Those take a write transaction, which is a poor thing to do several times a
+    second against a database a sync is writing to.
+    """
+    try:
+        conn = sqlite3.connect(str(DB), timeout=2.0)
+        try:
+            return fn(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return default
+
+
 def clear_job() -> None:
     global job_kind, job_started
     with proc_lock:
         job_kind, job_started = None, None
+    _quick(clear_phase)
+
+
+def set_step(label: str) -> None:
+    """Name the step about to run.
+
+    Writes the same row `main.py` writes, so the two take turns on one channel:
+    serve names the step it is about to launch, and the step overwrites that with
+    whatever it is doing inside itself.
+    """
+    _quick(lambda conn: set_phase(conn, label))
 
 
 def job_state() -> dict:
     """What a tab needs to show the running job as if it had started it."""
     with proc_lock:
         kind, started = job_kind, job_started
+    # Only meaningful while something holds the lock; a row left behind by a
+    # server that died mid-sync would otherwise read as live progress.
+    step = _quick(get_phase) if sync_lock.locked() else None
     return {
         "running": sync_lock.locked(),
         "job": kind,
+        "step": step,
         "elapsed": round(time.monotonic() - started, 1) if started else 0,
     }
 
@@ -180,16 +213,20 @@ def job_state() -> dict:
 def requests_today() -> dict:
     """API requests spent this UTC day, for the counter in the page header.
 
-    Rides along on the heartbeat rather than getting a poll of its own: the tab
-    is already asking every 15s, and two indexed counts cost less than the
-    request that carries them. A database that will not open is not worth
-    failing a heartbeat over, so the counter simply goes quiet.
+    Rides along on the heartbeat rather than getting a poll of its own, and the
+    heartbeat speeds up while a job runs so the figure tracks the spend live.
+
+    Opened raw rather than through store.connect(): that applies the schema and
+    runs the migration, which takes a write transaction -- fine once per page
+    load, wasteful several times a second, and pointless contention with the
+    sync writing on the other side. This only ever reads one row. A database
+    that will not open is not worth failing a heartbeat over, so the counter
+    simply goes quiet.
     """
-    try:
-        with db() as conn:
-            sync, desc = requests_used_today(conn)
-    except sqlite3.Error:
+    counts = _quick(requests_used_today)
+    if counts is None:
         return {}
+    sync, desc = counts
     return {"sync": sync, "desc": desc, "total": sync + desc}
 
 
@@ -199,12 +236,36 @@ def stopped_result(log: str, note: str) -> dict:
     The stopped step committed as it went, so the DB is consistent but the
     dashboard on disk is stale. Rebuilding is local and free, so it always runs.
     """
+    set_step("Rebuilding the page")
     build_code, build_out = run([str(BUILD), "--no-open"], force=True)
     return {
         "ok": False,
         "stopped": True,
         "error": note,
         "log": log + build_out,
+        "rebuilt": build_code == 0,
+    }
+
+
+def quota_result(log: str, note: str) -> dict:
+    """Close out a run with no allowance left to spend.
+
+    The sweep and the prunes inside the sync step have already run -- they cost
+    no request -- so the page on disk is behind the database. Rebuilding is
+    local and free, and puts the two back in step.
+
+    Reached two ways: the cap check refusing before a request is sent, and the
+    API refusing partway through. The second has notices to show for it.
+    """
+    set_step("Compacting the database")
+    _, vac_out = run([str(CLI), "vacuum"], timeout=600, force=True)
+    set_step("Rebuilding the page")
+    build_code, build_out = run([str(BUILD), "--no-open"], force=True)
+    return {
+        "ok": False,
+        "quota": True,
+        "error": note,
+        "log": log + vac_out + build_out,
         "rebuilt": build_code == 0,
     }
 
@@ -219,18 +280,20 @@ def do_sync() -> dict:
             stop_requested = False
             job_kind, job_started = "sync", time.monotonic()
 
-        # sync -> descriptions -> re-rank -> rebuild
+        # sync -> descriptions -> rebuild. Ranking has its own button.
         # the API's search endpoint has a fixed per-request latency that can swing
         # from ~3s to ~200s regardless of page size, so a routine 6-page window
         # can take 20+ minutes. The old 900s default killed those runs mid-flight.
+        set_step("Syncing notices")
         code, output = run([str(CLI), "sync", "--since-last"], timeout=2700)
         if stopped():
             return stopped_result(output, "Stopped. Notices fetched so far are saved.")
         if quota_message(output):
-            return {"ok": False, "quota": True, "error": quota_message(output)}
+            return quota_result(output, quota_message(output))
         if code != 0:
             return {"ok": False, "error": output.strip()[-400:], "log": output}
 
+        set_step("Fetching descriptions")
         desc_code, desc_out = run([str(CLI), "describe"], timeout=1800)
         if stopped():
             return stopped_result(
@@ -238,22 +301,17 @@ def do_sync() -> dict:
                 "Stopped. The sync finished; descriptions fetched so far are saved.",
             )
 
-        # Whichever ranker you last chose; running the other one would silently
-        # revert the switch on every sync.
-        with db() as conn:
-            ranker = active_ranker(conn)
-        score_code, score_out = run([str(CLI), "rocchio" if ranker == "rocchio" else "score"])
-        if stopped():
-            return stopped_result(
-                output + desc_out + score_out,
-                "Stopped before ranking finished; the notices themselves are saved.",
-            )
+        # After the pruning, before the page: it needs the database to itself,
+        # and a failure here costs nothing worth stopping the run over.
+        set_step("Compacting the database")
+        _, vac_out = run([str(CLI), "vacuum"], timeout=600)
 
+        set_step("Rebuilding the page")
         build_code, build_out = run([str(BUILD), "--no-open"])
         if build_code != 0:
             return {"ok": False, "error": build_out.strip()[-800:]}
 
-        log = output + desc_out + score_out + build_out
+        log = output + desc_out + vac_out + build_out
         return {"ok": True, "log": log,
                 "summary": summarize(output) + " · " + summarize(desc_out)}
     except subprocess.TimeoutExpired as exc:
@@ -282,12 +340,14 @@ def do_rerank() -> dict:
             stop_requested = False
             job_kind, job_started = "rerank", time.monotonic()
 
+        set_step("Re-ranking")
         code, output = run([str(CLI), "rocchio"])
         if stopped():
             return stopped_result(output, "Stopped. Ranking is unchanged.")
         if code != 0:
             return {"ok": False, "error": output.strip()[-400:], "log": output}
 
+        set_step("Rebuilding the page")
         build_code, build_out = run([str(BUILD), "--no-open"])
         if build_code != 0:
             return {"ok": False, "error": build_out.strip()[-800:]}

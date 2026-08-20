@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS opportunities (
     award_date          TEXT,
     award_amount        REAL,
     awardee             TEXT,
+    -- Consecutive covering syncs that did not return this notice. One absence
+    -- is not evidence of archival -- see deactivate_missing.
+    misses              INTEGER NOT NULL DEFAULT 0,
     first_seen          TEXT NOT NULL,
     last_seen           TEXT NOT NULL
 );
@@ -47,7 +50,7 @@ CREATE TABLE IF NOT EXISTS changes (
     detected_at TEXT NOT NULL,
     run_id      INTEGER,
     -- 'sync' = value differed; 'missing' = the API stopped returning it;
-    -- 'archive_date' = inferred locally
+    -- 'archive_date' = inferred locally; 'repair' = a bad inference undone
     source      TEXT
 );
 
@@ -154,6 +157,8 @@ ON CONFLICT(notice_id) DO UPDATE SET
     award_date          = excluded.award_date,
     award_amount        = excluded.award_amount,
     awardee             = excluded.awardee,
+    -- Seeing it again clears whatever absence was recorded against it.
+    misses              = 0,
     last_seen           = excluded.last_seen
 """
 
@@ -182,6 +187,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("award_amount", "REAL"),
         ("awardee", "TEXT"),
         ("classification_code", "TEXT"),
+        ("misses", "INTEGER NOT NULL DEFAULT 0"),
     ]
     with conn:
         for column, decl in added:
@@ -382,12 +388,31 @@ def is_expired(deadline: str | None, today: str) -> bool:
     return bool(deadline) and deadline[:10] < today
 
 
+# How many consecutive covering syncs must fail to return a notice before its
+# absence is treated as archival. One miss is not evidence: the API pages by
+# offset over a result set that is still being written to, so a live notice is
+# routinely returned by one sweep and absent from the next. Acting on the first
+# miss archived hundreds of solicitations months short of their deadlines.
+MISS_THRESHOLD = 2
+
+# The notice's own dates still say it is running: deadline ahead, stated archive
+# date ahead. These retire from the archive date alone, via sweep_archived -- two
+# upstream dates being wrong is far less likely than one dropped record, and the
+# cost of the two errors is not symmetric: a wrongly archived notice is one you
+# never get to bid on.
+STILL_RUNNING = (
+    "response_deadline IS NOT NULL AND substr(response_deadline, 1, 10) >= ? "
+    "AND archive_date IS NOT NULL AND archive_date >= ?"
+)
+
+
 def deactivate_missing(
     conn: sqlite3.Connection,
     posted_from: str,
     posted_to: str,
     run_started: str,
     run_id: int | None = None,
+    today: str | None = None,
 ) -> int:
     """Flag stored notices that the API no longer returns as inactive.
 
@@ -395,22 +420,33 @@ def deactivate_missing(
     would otherwise keep claiming active=1 forever. Anything inside the window we
     just swept that was not touched by this run has gone away upstream. Scoped to
     the synced window so a narrow `--days 7` run cannot deactivate older rows.
-    """
-    gone = [
-        row[0]
-        for row in conn.execute(
-            """SELECT notice_id FROM opportunities
-               WHERE active = 1
-                 AND posted_date >= ? AND posted_date <= ?
-                 AND last_seen < ?""",
-            (posted_from, posted_to, run_started),
-        )
-    ]
-    if not gone:
-        return 0
 
-    now = utcnow()
+    Absence is COUNTED. A notice has to be missed by MISS_THRESHOLD consecutive
+    covering runs before it is retired, and any sighting resets the count to
+    zero. Notices whose deadline and stated archive date are both still ahead
+    are left to `sweep_archived`, which retires them from the archive date once
+    it arrives.
+    """
+    today = today or date.today().isoformat()
+    unseen = "active = 1 AND posted_date >= ? AND posted_date <= ? AND last_seen < ?"
+    window = (posted_from, posted_to, run_started)
+
     with conn:
+        # Charge a miss to everything this run should have returned and did not.
+        conn.execute(f"UPDATE opportunities SET misses = misses + 1 WHERE {unseen}", window)
+
+        gone = [
+            row[0]
+            for row in conn.execute(
+                f"SELECT notice_id FROM opportunities "
+                f"WHERE {unseen} AND misses >= ? AND NOT ({STILL_RUNNING})",
+                (*window, MISS_THRESHOLD, today, today),
+            )
+        ]
+        if not gone:
+            return 0
+
+        now = utcnow()
         conn.executemany(
             "UPDATE opportunities SET active = 0 WHERE notice_id = ?",
             [(nid,) for nid in gone],
@@ -423,6 +459,40 @@ def deactivate_missing(
             [(nid, now, run_id) for nid in gone],
         )
     return len(gone)
+
+
+def repair_false_archives(conn: sqlite3.Connection, today: str | None = None) -> int:
+    """Reactivate notices that absence retired while their own dates said otherwise.
+
+    Undoes what deactivate_missing did before it counted misses: notices dropped
+    from a single sweep and archived on the spot, deadline and archive date both
+    still ahead. Recorded as source='repair' so the correction is as visible in
+    the history as the mistake was.
+    """
+    today = today or date.today().isoformat()
+    revived = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT notice_id FROM opportunities WHERE active = 0 AND ({STILL_RUNNING})",
+            (today, today),
+        )
+    ]
+    if not revived:
+        return 0
+
+    now = utcnow()
+    with conn:
+        conn.executemany(
+            "UPDATE opportunities SET active = 1, misses = 0 WHERE notice_id = ?",
+            [(nid,) for nid in revived],
+        )
+        conn.executemany(
+            """INSERT INTO changes
+               (notice_id, field, old_value, new_value, detected_at, run_id, source)
+               VALUES (?, 'active', '0', '1', ?, NULL, 'repair')""",
+            [(nid, now) for nid in revived],
+        )
+    return len(revived)
 
 
 def sweep_archived(conn: sqlite3.Connection, today: str, run_id: int | None = None) -> int:
@@ -617,6 +687,31 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def active_ranker(conn: sqlite3.Connection) -> str:
     return get_meta(conn, "ranker", DEFAULT_RANKER) or DEFAULT_RANKER
+
+
+# -- progress ---------------------------------------------------------------
+
+# What the running command is doing right now, for the status line under the
+# Sync button. The database is the channel because the steps are subprocesses:
+# serve.py collects their output with proc.communicate(), which returns only
+# once they exit, so a row they can write and it can read is the one place both
+# sides already meet.
+PHASE_KEY = "phase"
+
+
+def set_phase(conn: sqlite3.Connection, label: str) -> None:
+    set_meta(conn, PHASE_KEY, label)
+
+
+def get_phase(conn: sqlite3.Connection) -> str | None:
+    return get_meta(conn, PHASE_KEY)
+
+
+def clear_phase(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("DELETE FROM meta WHERE key = ?", (PHASE_KEY,))
+
+
 
 
 def write_scores(

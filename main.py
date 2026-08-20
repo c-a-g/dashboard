@@ -45,6 +45,7 @@ from lib.store import (
     prune_expired,
     record_requests,
     prune_older_than,
+    set_phase,
     requests_used_today,
     retention_cutoff,
     RETENTION_YEARS,
@@ -112,6 +113,33 @@ def cmd_sync(args: argparse.Namespace) -> int:
             print(f"Daily API quota used up: {spent} of {args.cap} requests spent "
                   "today. It resets at midnight UTC. Nothing fetched, and nothing "
                   "charged for asking.")
+            # The request-free maintenance still runs: the archive sweep reads
+            # dates already stored, and the retention prune is pure bookkeeping.
+            # Absence-based archiving needs a run to compare against, so it
+            # belongs with the fetch loop below.
+            today = date.today().isoformat()
+            swept = 0
+            if not args.no_sweep:
+                set_phase(conn, "Retiring notices past their archive date")
+                swept = sweep_archived(conn, today)
+            purged: dict[str, int] = {}
+            expired_purged: dict[str, int] = {}
+            if not args.no_purge:
+                set_phase(conn, f"Purging notices posted over {args.retain_years} years ago")
+                cutoff = retention_cutoff(today, args.retain_years)
+                purged = prune_older_than(conn, cutoff, today, keep_open=not args.purge_open)
+            if not args.keep_expired:
+                set_phase(conn, "Purging notices whose deadline has passed")
+                expired_purged = prune_expired(conn, today)
+            if swept:
+                print(f"  {swept} past their own archive date; marked inactive "
+                      "(inferred, no API call).")
+            if purged.get("opportunities"):
+                print(f"  Purged {describe_prune(purged)} posted over "
+                      f"{args.retain_years} years ago.")
+            if expired_purged.get("opportunities"):
+                print(f"  Purged {describe_prune(expired_purged)} whose deadline "
+                      "has passed.")
             conn.close()
             return 0
 
@@ -139,7 +167,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
     else:
         posted_from = posted_to - timedelta(days=days)
 
-    client = ApiClient(api_key, sleep_between=args.sleep, stop_on_rate_limit=True)
+    # Charged per request as it goes out, so the counter tracks a run that lasts
+    # 20 minutes and survives one that is stopped or killed part-way.
+    client = ApiClient(
+        api_key,
+        sleep_between=args.sleep,
+        stop_on_rate_limit=True,
+        on_request=lambda n: record_requests(conn, "sync", n),
+    )
     run_id = start_run(conn, posted_from.isoformat(), posted_to.isoformat())
 
     seen = stored = skipped = expired = changed = 0
@@ -149,6 +184,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     run_started = utcnow()
 
     log.info("Syncing notices posted %s .. %s", posted_from, posted_to)
+    set_phase(conn, f"Fetching notices posted {posted_from} to {posted_to}")
     try:
         records = client.iter_opportunities(
             posted_from,
@@ -172,6 +208,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 stored, changed = stored + n, changed + c
                 batch.clear()
                 log.info("  stored %d titles so far (%d seen)", stored, seen)
+                set_phase(conn, f"Fetching notices — {stored:,} stored")
         n, c = upsert_many(conn, batch, run_id=run_id)
         stored, changed = stored + n, changed + c
     except KeyboardInterrupt:
@@ -199,23 +236,29 @@ def cmd_sync(args: argparse.Namespace) -> int:
             api_requests=client.request_count,
             error=error,
         )
-        record_requests(conn, "sync", client.request_count)
 
     # An archived notice is simply absent, never flagged.
     archived = swept = 0
     if not error:
+        set_phase(conn, "Retiring notices the API stopped returning")
         archived = deactivate_missing(
-            conn, posted_from.isoformat(), posted_to.isoformat(), run_started, run_id
+            conn, posted_from.isoformat(), posted_to.isoformat(), run_started, run_id, today
         )
         # Outside the window, retire from the stated archive date instead.
         if not args.no_sweep:
+            set_phase(conn, "Retiring notices past their archive date")
             swept = sweep_archived(conn, today, run_id)
 
     # Skipped on error: a partial sync is no time to delete.
     purged: dict[str, int] = {}
+    expired_purged: dict[str, int] = {}
     if not error and not args.no_purge:
+        set_phase(conn, f"Purging notices posted over {args.retain_years} years ago")
         cutoff = retention_cutoff(today, args.retain_years)
         purged = prune_older_than(conn, cutoff, today, keep_open=not args.purge_open)
+    if not error and not args.keep_expired:
+        set_phase(conn, "Purging notices whose deadline has passed")
+        expired_purged = prune_expired(conn, today)
 
     total, live = conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(active), 0) FROM opportunities"
@@ -231,6 +274,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"  {swept} past their own archive date; marked inactive (inferred, no API call).")
     if purged.get("opportunities"):
         print(f"  Purged {describe_prune(purged)} posted over {args.retain_years} years ago.")
+    if expired_purged.get("opportunities"):
+        print(f"  Purged {describe_prune(expired_purged)} whose deadline has passed.")
     if changed:
         print(f"\n{changed} field change(s) detected on existing notices:")
         for field, n in conn.execute(
@@ -321,8 +366,16 @@ def cmd_describe(args: argparse.Namespace) -> int:
         conn.close()
         return 0
 
-    client = ApiClient(api_key, sleep_between=args.sleep, stop_on_rate_limit=True)
+    # As in cmd_sync: spend is recorded as it goes out. `remaining` was fixed
+    # above, so the budget this run works to stays put as the table fills.
+    client = ApiClient(
+        api_key,
+        sleep_between=args.sleep,
+        stop_on_rate_limit=True,
+        on_request=lambda n: record_requests(conn, "desc", n),
+    )
     print(f"Fetching {len(queue)} descriptions, most worth reading first…")
+    set_phase(conn, f"Fetching descriptions — 0 of {len(queue):,}")
 
     fetched = failed = empty = 0
     interrupted = False
@@ -342,14 +395,13 @@ def cmd_describe(args: argparse.Namespace) -> int:
             fetched += 1
             if not text:
                 empty += 1
+            if i % 25 == 0:
+                set_phase(conn, f"Fetching descriptions — {i:,} of {len(queue):,}")
             if i % 100 == 0:
                 print(f"  {i}/{len(queue)} …")
     except KeyboardInterrupt:
         print("\nInterrupted -- everything fetched so far is saved.")
         interrupted = True
-    finally:
-        # Before any reporting: a stop or a refusal still spent what it spent.
-        record_requests(conn, "desc", client.request_count)
 
     # Two figures, because the queue no longer stops at the open ones: the first
     # is how much work is left in total, the second how much of it is biddable.
@@ -611,6 +663,34 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_vacuum(args: argparse.Namespace) -> int:
+    """Reclaim the pages the day's pruning freed.
+
+    Deleted rows leave free pages behind: SQLite reuses them for later inserts,
+    so the file holds steady rather than growing, but it never shrinks on its
+    own. VACUUM rewrites it at its true size. Its own step in the pipeline
+    because it takes an exclusive lock -- it has to run between the writing and
+    the page build, not alongside either.
+    """
+    conn = connect(args.db)
+    conn.commit()                      # VACUUM cannot run inside a transaction
+    path = Path(args.db)
+    before = path.stat().st_size
+    free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    page = conn.execute("PRAGMA page_size").fetchone()[0]
+    if free * page < args.min_free * 1e6:
+        print(f"Skipped: only {free * page / 1e6:.1f} MB free "
+              f"(rewriting the file is worth it past {args.min_free} MB).")
+        conn.close()
+        return 0
+    conn.execute("VACUUM")
+    conn.close()
+    after = path.stat().st_size
+    print(f"Vacuumed {free:,} free pages: "
+          f"{before / 1e6:.1f} MB -> {after / 1e6:.1f} MB.")
+    return 0
+
+
 def cmd_titles(args: argparse.Namespace) -> int:
     conn = connect(args.db)
 
@@ -718,6 +798,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-purge",
         action="store_true",
         help="keep notices older than the retention window",
+    )
+    sync.add_argument(
+        "--keep-expired",
+        action="store_true",
+        help="keep notices whose response deadline has passed (by default a sync "
+        "deletes them, along with their descriptions, scores and change history)",
     )
     sync.add_argument(
         "--purge-open",
@@ -876,6 +962,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = sub.add_parser("stats", help="summarize what is stored")
     stats.set_defaults(func=cmd_stats)
+
+    vacuum = sub.add_parser(
+        "vacuum",
+        help="reclaim space left by deleted notices",
+        description="Rewrites the database at its true size. A sync runs this "
+        "after pruning, before rebuilding the page.",
+    )
+    vacuum.add_argument(
+        "--min-free", type=float, default=5.0, metavar="MB",
+        help="skip unless at least this much is reclaimable (default: 5)",
+    )
+    vacuum.set_defaults(func=cmd_vacuum)
 
     return parser
 
